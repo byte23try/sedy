@@ -1,0 +1,10 @@
+'use strict';
+
+(function () {
+  window.eb = function (eobj) {
+    var origin = '*';
+    var parentWindow = window.opener || window.parent;
+
+    parentWindow.postMessage(JSON.stringify({ data: eobj, event: 'e', referrer: 'xdm' }), origin);
+  };
+})();
