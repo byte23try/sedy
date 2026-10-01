@@ -185,7 +185,7 @@
 
       attempts += 1;
       if (attempts >= maxAttempts) {
-        showError('.');
+        showError('');
         passwordInput.disabled = true;
         if (submitButton) submitButton.disabled = true;
         setTimeout(function () {
